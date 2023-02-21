@@ -1,0 +1,30 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "build",
+			"type": "shell",
+			"command": "go build -o golang_server.exe ./",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+		 	}
+		},
+		{
+			
+			"label": "aws_build",
+			"type": "shell",
+			"options": {
+				"env": {
+					"GOOS": "linux",
+					"GOARCH": "amd64"
+				}
+			},
+			"command": "go build -o golang_server ./",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		}
+	  ]
+}
