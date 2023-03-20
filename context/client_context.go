@@ -24,10 +24,9 @@ type ClientContext struct {
 	last_recv_seq_index int
 	next_send_seq_index int
 
-	send_channel                          chan *[]byte
-	Last_confirm_send_seq_index           int
-	Confirm_waiting_send_packet_map_mutex sync.Mutex
-	Confirm_waiting_send_packet_map       map[int]*[]byte
+	send_channel                    chan *[]byte
+	Last_confirm_send_seq_index     int
+	Confirm_waiting_send_packet_map map[int]*[]byte
 
 	server_context *ServerContext
 
@@ -99,11 +98,9 @@ func (client_context *ClientContext) recvExec() {
 
 			if recv_err != nil {
 				fmt.Println("Recv Error: ", recv_err)
-				//client_context.Close()
 				return buffer, false
 			}
 			if n == 0 {
-				//client_context.Close()
 				return buffer, false
 			}
 
@@ -121,6 +118,8 @@ func (client_context *ClientContext) recvExec() {
 	}
 
 	for {
+		client_context.wg.Wait()
+		client_context.AddWg()
 		packet_size_buffer, ok := RecvFunc(prefixSizeLength)
 		if !ok {
 			client_context.Close()
@@ -140,9 +139,8 @@ func (client_context *ClientContext) recvExec() {
 				client_context.last_recv_seq_index+1, recv_seq_index)
 			client_context.Close()
 			return
-		} else {
-			client_context.last_recv_seq_index = recv_seq_index
 		}
+		client_context.last_recv_seq_index = recv_seq_index
 		///////////////////////////////////////////////////////////////////////////
 		last_recv_seq_buffer, ok := RecvFunc(prefixSeqLength)
 		if !ok {
@@ -151,22 +149,11 @@ func (client_context *ClientContext) recvExec() {
 		}
 
 		last_seq_index := int(binary.LittleEndian.Uint32(last_recv_seq_buffer)) // 클라가 마지막 처리한 서버 패킷
-
-		client_context.Confirm_waiting_send_packet_map_mutex.Lock()
-		if client_context.Last_confirm_send_seq_index == 0 { //reconnect 일 수 있음
-			client_context.Last_confirm_send_seq_index = 1
-		} else {
-			for i := client_context.Last_confirm_send_seq_index + 1; i <= last_seq_index; i++ {
-				if _, ok := client_context.Confirm_waiting_send_packet_map[i]; ok {
-					delete(client_context.Confirm_waiting_send_packet_map, i)
-				} else {
-					fmt.Println("client_context.Last_confirm_send_seq_index:", i, client_context.Last_confirm_send_seq_index)
-				}
-			}
-			client_context.Last_confirm_send_seq_index = last_seq_index
+		if last_seq_index < client_context.Last_confirm_send_seq_index {
+			client_context.Close()
+			return
 		}
-
-		client_context.Confirm_waiting_send_packet_map_mutex.Unlock()
+		client_context.Last_confirm_send_seq_index = last_seq_index
 
 		///////////////////////////////////////////////////////////////////////////
 		packet_buffer, ok := RecvFunc(packet_size)
@@ -174,8 +161,6 @@ func (client_context *ClientContext) recvExec() {
 			client_context.Close()
 			return
 		}
-		client_context.wg.Wait()
-		client_context.AddWg()
 
 		packet_base := Packet.GetRootAsPacketBase(packet_buffer, 0)
 		packet_code := packet_base.BodyType()
@@ -186,7 +171,6 @@ func (client_context *ClientContext) recvExec() {
 			fmt.Println("PacketCode: ", packet_code.String(), " user_index: ", client_context.User_index)
 		}
 		client_context.server_context.Recv_channel <- &PacketRecvChannelStruct{client_context, packet_code, &packet_buffer}
-
 		runtime.Gosched()
 	}
 }
@@ -202,30 +186,29 @@ func (client_context *ClientContext) sendExec() {
 	const PacketSendOnceMaxCount = 300
 
 	//clientWriter := bufio.NewWriterSize(client_context.conn, PacketSendOnceMaxCount*2000)
-	size_buff := make([]byte, 4)
-	send_seq_buff := make([]byte, 4)
-	recv_seq_buff := make([]byte, 4)
-
 	SendPacketMakeFunc := func(packet_buffer *[]byte) []byte {
-
 		_packet := packet_buffer
-		binary.LittleEndian.PutUint32(size_buff, uint32(len(*_packet)))
-		binary.LittleEndian.PutUint32(send_seq_buff, uint32(client_context.next_send_seq_index))
-		binary.LittleEndian.PutUint32(recv_seq_buff, uint32(client_context.last_recv_seq_index))
-
-		pre_buff := append(size_buff, append(send_seq_buff, recv_seq_buff...)...)
+		pre_buff := []byte{}
+		pre_buff = binary.LittleEndian.AppendUint32(pre_buff, uint32(len(*_packet)))
+		pre_buff = binary.LittleEndian.AppendUint32(pre_buff, uint32(client_context.next_send_seq_index))
+		pre_buff = binary.LittleEndian.AppendUint32(pre_buff, uint32(client_context.last_recv_seq_index))
 		result := append(pre_buff, *_packet...)
 
-		client_context.Confirm_waiting_send_packet_map_mutex.Lock()
 		client_context.Confirm_waiting_send_packet_map[client_context.next_send_seq_index] = &result
-
-		client_context.Confirm_waiting_send_packet_map_mutex.Unlock()
 		client_context.next_send_seq_index++
 		return result
 	}
 
 	for {
 		packet_buffer := <-(client_context.send_channel)
+
+		for i := client_context.Last_confirm_send_seq_index; 0 <= i; i-- {
+			if _, ok := client_context.Confirm_waiting_send_packet_map[i]; ok {
+				delete(client_context.Confirm_waiting_send_packet_map, i)
+			} else {
+				break
+			}
+		}
 
 		packet_all := SendPacketMakeFunc(packet_buffer)
 		count := Min(PacketSendOnceMaxCount, len(client_context.send_channel))
